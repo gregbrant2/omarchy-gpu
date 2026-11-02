@@ -66,9 +66,13 @@ nothing beyond the kernel. `pciutils` for the card name on AMD and Intel.
 
 ## Notes
 
-I develop and test this against an NVIDIA card. The AMD path follows the
-documented sysfs contract but I cannot exercise it. The Intel path is tested
-on a Panther Lake laptop (xe driver).
+This was originally developed and tested against an NVIDIA card. The Intel
+path is tested on a Panther Lake laptop (xe driver). The AMD path follows
+the documented sysfs contract but I cannot exercise it. 
+
+On Nvidia, the process list merges compute clients with the graphics clients
+from `nvidia-smi -q -d PIDS`, so your compositor and browser show up, not 
+just CUDA jobs.
 
 Intel load comes from the kernel's per-client DRM accounting in
 `/proc/<pid>/fdinfo`: the engine time every client used since the previous
@@ -78,10 +82,6 @@ root or container workload does not count towards it; when no client is
 readable at all, the figure falls back to how long the GT spent out of its
 idle state. The first poll after login has nothing to diff against and shows
 a dash.
-
-The process list merges compute clients with the graphics clients from
-`nvidia-smi -q -d PIDS`, so your compositor and browser show up, not just CUDA
-jobs.
 
 On hybrid laptops the NVIDIA card powers itself off when idle (runtime D3).
 Every `nvidia-smi` call would wake it, so where the card's `power/control` is
