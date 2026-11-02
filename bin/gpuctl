@@ -7,7 +7,8 @@ queries the GPU and exits.
 Supported:
   NVIDIA  via nvidia-smi (load, VRAM, temp, power, clocks, fan, processes)
   AMD     via /sys/class/drm/card*/device (amdgpu: busy %, VRAM, hwmon)
-  Intel   via /sys/class/drm/card*/device (i915/xe: frequency, hwmon)
+  Intel   via /proc/*/fdinfo and /sys/class/drm/card*/device
+          (i915/xe: engine busy %, processes, frequency, hwmon)
 
 Usage:
   gpuctl get [--json]        current state for the first/selected GPU
@@ -285,28 +286,26 @@ PCI_IDS_MAX_LINES = 200000
 _NV_CLIENT_DEV = re.compile(r"^/dev/nvidia(\d+|-uvm)$")
 
 
-def _cache_path():
+def _cache_path(name):
     """Per-session cache file, or None: never fall back to a shared /tmp."""
     base = os.environ.get("XDG_RUNTIME_DIR")
-    return os.path.join(base, "omarchy-gpu-nvidia.json") if base else None
+    return os.path.join(base, f"omarchy-gpu-{name}.json") if base else None
 
 
-def _cache_load():
-    """(timestamp, [gpu dicts]) from the last nvidia-smi reading."""
-    path = _cache_path()
+def _cache_read(name):
+    """The cached JSON object, or None when absent or unreadable."""
+    path = _cache_path(name)
     raw = read(path) if path else None
     try:
-        data = json.loads(raw) if raw else {}
-        gpus = data.get("gpus") if isinstance(data, dict) else None
-        gpus = [g for g in gpus if isinstance(g, dict)][:MAX_GPUS] if isinstance(gpus, list) else []
-        return float(data.get("t", 0)), gpus
-    except (ValueError, TypeError, AttributeError):
-        return 0.0, []
+        data = json.loads(raw) if raw else None
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
-def _cache_save(t, gpus):
+def _cache_write(name, data):
     """Replace the cache file atomically, in a private temp file beside it."""
-    path = _cache_path()
+    path = _cache_path(name)
     if not path:
         return
     tmp = None
@@ -314,7 +313,7 @@ def _cache_save(t, gpus):
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
                                    prefix=".omarchy-gpu-", suffix=".tmp")
         with os.fdopen(fd, "w") as f:
-            json.dump({"t": t, "gpus": gpus}, f)
+            json.dump(data, f)
         os.replace(tmp, path)
     except OSError:
         if tmp is not None:
@@ -322,6 +321,21 @@ def _cache_save(t, gpus):
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def _cache_load():
+    """(timestamp, [gpu dicts]) from the last nvidia-smi reading."""
+    data = _cache_read("nvidia") or {}
+    try:
+        gpus = data.get("gpus")
+        gpus = [g for g in gpus if isinstance(g, dict)][:MAX_GPUS] if isinstance(gpus, list) else []
+        return float(data.get("t", 0)), gpus
+    except (ValueError, TypeError, AttributeError):
+        return 0.0, []
+
+
+def _cache_save(t, gpus):
+    _cache_write("nvidia", {"t": t, "gpus": gpus})
 
 
 def nvidia_pci_power():
@@ -497,7 +511,173 @@ def sysfs_hwmon(device_dir):
     return out
 
 
-def sysfs_list():
+# ---- Intel load via DRM fdinfo ------------------------------------------
+#
+# amdgpu publishes a ready-made gpu_busy_percent; i915 and xe do not. What
+# they do publish is per-client accounting in /proc/<pid>/fdinfo/<fd> for
+# every open render node: how long each engine spent on that client's work.
+# Load is therefore the engine time all clients consumed since the previous
+# poll over the time elapsed, and the same numbers give the process list.
+# xe counts in GPU ticks (drm-cycles-* busy, drm-total-cycles-* elapsed);
+# i915 counts in nanoseconds (drm-engine-* busy, against wall time).
+#
+# Reading another process's fdinfo needs ptrace access, so only the user's
+# own clients count. On a single-user desktop that is the compositor and
+# everything it draws, which is what the widget is for. When no client is
+# readable at all, the GT's idle-state residency gives a whole-card figure
+# instead: a GT not in C6 is running something.
+#
+# The previous sample lives in a per-session cache file, like the NVIDIA one.
+
+_DRM_PDEV = re.compile(r"^drm-pdev:\s*(\S+)", re.M)
+_DRM_CLIENT = re.compile(r"^drm-client-id:\s*(\d+)", re.M)
+_DRM_CYCLES = re.compile(r"^drm-cycles-(\w+):\s*(\d+)", re.M)
+_DRM_TOTAL_CYCLES = re.compile(r"^drm-total-cycles-(\w+):\s*(\d+)", re.M)
+_DRM_ENGINE_NS = re.compile(r"^drm-engine-(\w+):\s*(\d+)\s*ns", re.M)
+_DRM_RESIDENT = re.compile(r"^drm-resident-(\w+):\s*(\d+)\s*(KiB|MiB|GiB)?", re.M)
+_DRM_UNIT = {None: 1, "": 1, "KiB": 1024, "MiB": 1048576, "GiB": 1073741824}
+# Bound on clients read per poll; a desktop has a few dozen.
+MAX_DRM_CLIENTS = 256
+
+
+def drm_clients(slot):
+    """{client_id: {pid, cycles, total, ns, memBytes}} for the card at PCI `slot`.
+
+    Walks /proc/*/fd for links into /dev/dri and reads the fdinfo behind
+    each one. readlink is cheap and fdinfo is not, so only DRM fds are read.
+    A client that is open on several fds (dup, fork) appears once.
+    """
+    clients = {}
+    for fd_dir in glob.glob("/proc/[0-9]*/fd"):
+        pid = fd_dir.split("/")[2]
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if not target.startswith("/dev/dri/"):
+                continue
+            info = read(f"/proc/{pid}/fdinfo/{fd}")
+            if not info:
+                continue
+            m = _DRM_PDEV.search(info)
+            if not m or m.group(1) != slot:
+                continue
+            m = _DRM_CLIENT.search(info)
+            if not m or m.group(1) in clients:
+                continue
+            clients[m.group(1)] = {
+                "pid": int(pid),
+                "cycles": {e: int(v) for e, v in _DRM_CYCLES.findall(info)},
+                "total": {e: int(v) for e, v in _DRM_TOTAL_CYCLES.findall(info)},
+                "ns": {e: int(v) for e, v in _DRM_ENGINE_NS.findall(info)},
+                "memBytes": sum(int(v) * _DRM_UNIT.get(u, 1)
+                                for _, v, u in _DRM_RESIDENT.findall(info)),
+            }
+            if len(clients) >= MAX_DRM_CLIENTS:
+                return clients
+    return clients
+
+
+def gt_idle_ms(card):
+    """Idle-state residency of the first GT in ms: xe gtidle, else i915 rc6."""
+    for path in sorted(glob.glob(os.path.join(card, "device", "tile*", "gt*",
+                                              "gtidle", "idle_residency_ms"))):
+        v = read_int(path)
+        if v is not None:
+            return v
+    return read_int(os.path.join(card, "gt", "gt0", "rc6_residency_ms"))
+
+
+def _client_busy(now, prev_t, cur, prev):
+    """Busy % per engine for one client between two samples."""
+    busy = {}
+    for eng, ticks in cur["cycles"].items():
+        d_total = cur["total"].get(eng, 0) - prev.get("total", {}).get(eng, 0)
+        if d_total > 0:
+            busy[eng] = 100.0 * (ticks - prev.get("cycles", {}).get(eng, 0)) / d_total
+    elapsed_ns = (now - prev_t) * 1e9
+    if elapsed_ns > 0:
+        for eng, ns in cur["ns"].items():
+            busy[eng] = 100.0 * (ns - prev.get("ns", {}).get(eng, 0)) / elapsed_ns
+    return {e: min(max(v, 0.0), 100.0) for e, v in busy.items()}
+
+
+def drm_load(card, slot, top_n=TOP_DEFAULT):
+    """(load %, per-engine %, processes, resident bytes) from fdinfo deltas.
+
+    load is the busiest engine, the figure nvtop and intel_gpu_top head with.
+    Resident bytes sum over every readable client, not only the listed ones.
+    The first poll after login has nothing to diff against and returns
+    (None, {}, None, None); the widget shows a dash for one interval.
+    """
+    now = time.monotonic()
+    clients = drm_clients(slot)
+    idle = gt_idle_ms(card)
+    cache = _cache_read("drm") or {}
+    prev = cache.get(slot) if isinstance(cache.get(slot), dict) else None
+    cache[slot] = {"t": now, "idle": idle,
+                   "clients": {cid: {"cycles": c["cycles"], "total": c["total"], "ns": c["ns"]}
+                               for cid, c in clients.items()}}
+    _cache_write("drm", cache)
+    if not prev:
+        return None, {}, None, None
+    prev_t = float(prev.get("t", 0))
+    prev_clients = prev.get("clients") or {}
+
+    engines = {}
+    per_pid = {}
+    for cid, c in clients.items():
+        p = prev_clients.get(cid)
+        if not isinstance(p, dict):
+            continue
+        busy = _client_busy(now, prev_t, c, p)
+        for eng, v in busy.items():
+            engines[eng] = engines.get(eng, 0.0) + v
+        row = per_pid.setdefault(c["pid"], {"loadPct": 0.0, "memBytes": 0})
+        row["loadPct"] += max(busy.values(), default=0.0)
+        row["memBytes"] += c["memBytes"]
+    engines = {e: round(min(v, 100.0), 1) for e, v in engines.items()}
+
+    procs = []
+    for pid, row in per_pid.items():
+        name = proc_name(pid)
+        if name:
+            procs.append({"pid": pid, "name": name,
+                          "memMiB": round(row["memBytes"] / 1048576.0),
+                          "loadPct": round(min(row["loadPct"], 100.0), 1)})
+    procs.sort(key=lambda p: (-p["loadPct"], -(p["memMiB"] or 0), p["pid"]))
+    procs = procs[:min(top_n, MAX_PROCS_PER_GPU)]
+    resident = sum(c["memBytes"] for c in clients.values())
+
+    if engines:
+        return round(max(engines.values())), engines, procs, resident
+    # No readable client: a whole-card figure from idle residency instead.
+    if idle is not None and prev.get("idle") is not None and now > prev_t:
+        idle_frac = (idle - prev["idle"]) / ((now - prev_t) * 1000.0)
+        return round(100.0 * min(max(1.0 - idle_frac, 0.0), 1.0)), {}, procs, resident
+    return None, {}, procs, resident
+
+
+def intel_clocks(card):
+    """(requested MHz, max MHz) for the first GT: xe freq0, else i915 card attrs.
+
+    The requested clock, not the actual one: act_freq reads 0 whenever the GT
+    is powered down between frames, which on a desktop is most of the time.
+    """
+    for gt in sorted(glob.glob(os.path.join(card, "device", "tile*", "gt*", "freq0"))):
+        cur = read_int(os.path.join(gt, "cur_freq"))
+        if cur is not None:
+            return cur, read_int(os.path.join(gt, "rp0_freq"))
+    cur = read_int(os.path.join(card, "gt_cur_freq_mhz"))
+    return cur, (read_int(os.path.join(card, "gt_RP0_freq_mhz")) if cur is not None else None)
+
+
+def sysfs_list(top_n=TOP_DEFAULT):
     """AMD and Intel cards from /sys/class/drm. Empty when nothing matches."""
     gpus = []
     for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
@@ -516,16 +696,26 @@ def sysfs_list():
         load = read_int(os.path.join(dev, "gpu_busy_percent"))
         used = read_int(os.path.join(dev, "mem_info_vram_used"))
         total = read_int(os.path.join(dev, "mem_info_vram_total"))
+        slot = os.path.basename(os.path.realpath(dev))
+        engines = {}
+        # No per-process VRAM accounting on AMD; null hides the list.
+        processes = None
         clock = None
+        max_clock = None
         raw = read(os.path.join(dev, "pp_dpm_sclk")) or ""
         for line in raw.splitlines():
-            if line.strip().endswith("*"):
-                m = re.search(r"(\d+)\s*Mhz", line, re.I)
-                if m:
+            m = re.search(r"(\d+)\s*Mhz", line, re.I)
+            if m:
+                max_clock = int(m.group(1))
+                if line.strip().endswith("*"):
                     clock = int(m.group(1))
-        if clock is None:
-            khz = read_int(os.path.join(dev, "gt_cur_freq_mhz"))
-            clock = khz if khz else None
+        if vendor == "Intel":
+            load, engines, processes, resident = drm_load(card, slot, top_n)
+            clock, max_clock = intel_clocks(card)
+            if used is None and resident:
+                # Integrated graphics share system RAM: this is what the
+                # readable clients hold, with no total to set it against.
+                used = resident
 
         hw = sysfs_hwmon(dev)
         gpus.append({
@@ -533,7 +723,9 @@ def sysfs_list():
             "index": len(gpus),
             "name": gpu_name(dev, vendor, driver),
             "driver": driver,
+            "pdev": slot,
             "load": load,
+            "engines": engines,
             "memLoad": None,
             "memUsedMiB": round(used / 1048576.0) if used else None,
             "memTotalMiB": round(total / 1048576.0) if total else None,
@@ -541,10 +733,11 @@ def sysfs_list():
             "powerW": hw["powerW"],
             "powerLimitW": None,
             "clockMhz": clock,
-            "maxClockMhz": None,
+            "maxClockMhz": max_clock,
             "memClockMhz": None,
             "fanPct": hw["fanPct"],
             "pstate": None,
+            "processes": processes,
         })
     return gpus
 
@@ -555,10 +748,11 @@ def gpu_name(dev, vendor, driver):
     out = run(["lspci", "-s", slot])
     if out:
         line = out.strip().splitlines()[0] if out.strip() else ""
-        m = re.search(r":\s*(.+)$", line)
+        # "00:02.0 VGA compatible controller: Intel Corporation ..." — the
+        # slot has colons of its own, so skip it before looking for the class.
+        m = re.match(r"^\S+\s+[^:]+:\s*(.+)$", line)
         if m:
             name = m.group(1)
-            name = re.sub(r"^(VGA compatible controller|3D controller|Display controller):\s*", "", name)
             name = re.sub(r"\s*\(rev [0-9a-f]+\)$", "", name)
             return safe_name(name, FIELD_MAX)
     return f"{vendor} GPU ({driver})"
@@ -568,11 +762,7 @@ def gpu_name(dev, vendor, driver):
 
 def list_gpus(top_n=TOP_DEFAULT):
     gpus = nvidia_gpus(top_n)[:MAX_GPUS]
-    sys_gpus = sysfs_list()
-    for g in sys_gpus:
-        # No per-process VRAM accounting outside NVIDIA; null hides the list.
-        g["processes"] = None
-    gpus.extend(sys_gpus)
+    gpus.extend(sysfs_list(top_n))
     return gpus[:MAX_GPUS]
 
 
@@ -618,10 +808,21 @@ def doctor():
     add(True, "sysfs GPUs",
         ", ".join(f"{g['vendor']} {g['driver']}" for g in sysg) if sysg
         else "no amdgpu/i915/xe card; AMD and Intel readings unavailable")
+    for g in sysg:
+        if g["vendor"] != "Intel":
+            continue
+        clients = len(drm_clients(g["pdev"]))
+        add(clients > 0, "Intel DRM clients readable",
+            f"{clients} client fd(s) in /proc/*/fdinfo; engines: "
+            + (", ".join(f"{e} {v}%" for e, v in sorted(g["engines"].items()))
+               or "no delta yet, poll again"),
+            "no readable DRM client; load falls back to GT idle residency")
 
     state = get()
     add(state is not None, "Readings available",
-        f"{state['name']}: load {state['load']}%, {state['memUsedMiB']}/{state['memTotalMiB']} MiB"
+        f"{state['name']}: load {state['load']}%, "
+        + (f"{state['memUsedMiB']}/{state['memTotalMiB']} MiB" if state["memTotalMiB"] is not None
+           else f"{state['memUsedMiB']} MiB")
         if state else "",
         "install the vendor driver tools (nvidia-utils for NVIDIA)")
 
@@ -669,7 +870,8 @@ def print_human(state):
     print(f"  {state['name']}  ({state['vendor']}, driver {state['driver'] or '-'})")
     rows = [
         ("load", f"{state['load']}%" if state["load"] is not None else None),
-        ("vram", f"{state['memUsedMiB']} / {state['memTotalMiB']} MiB"
+        ("vram", (f"{state['memUsedMiB']} / {state['memTotalMiB']} MiB"
+                  if state["memTotalMiB"] is not None else f"{state['memUsedMiB']} MiB")
                  if state["memUsedMiB"] is not None else None),
         ("temp", f"{state['tempC']}°C" if state["tempC"] is not None else None),
         ("power", f"{state['powerW']} / {state['powerLimitW']} W"
@@ -678,6 +880,8 @@ def print_human(state):
         ("memclk", f"{state['memClockMhz']} MHz" if state["memClockMhz"] is not None else None),
         ("fan", f"{state['fanPct']}%" if state["fanPct"] is not None else None),
         ("pstate", state["pstate"]),
+        ("engines", "  ".join(f"{e} {v}%" for e, v in sorted(state["engines"].items()))
+                    if state.get("engines") else None),
     ]
     width = max(len(r[0]) for r in rows)
     for label, value in rows:
@@ -686,7 +890,8 @@ def print_human(state):
     if state.get("processes"):
         print("  clients")
         for p in state["processes"]:
-            print(f"    {p['memMiB']:>6} MiB  {p['pid']:>7}  {p['name']}")
+            load = f"{p['loadPct']:>5}%" if p.get("loadPct") is not None else "      "
+            print(f"    {load}  {p['memMiB']:>6} MiB  {p['pid']:>7}  {p['name']}")
 
 
 def main():

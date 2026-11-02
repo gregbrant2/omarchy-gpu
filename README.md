@@ -35,7 +35,7 @@ Bind a hotkey with `omarchy-shell shell toggle dansmith888.gpu`.
 | Graph | Recent load, 30 to 240 samples |
 | Meters | Load, VRAM, power against its limit |
 | Sensors | Temperature, fan, core and memory clocks, performance state |
-| Using the GPU | Processes holding GPU memory, biggest first |
+| Using the GPU | Processes holding GPU memory, biggest first; on Intel, each one's share of the load too |
 | In the bar | Which readings the pill shows, card picker, refresh rate, °C or °F |
 | Layout | A fixed pill width, or auto |
 | Warning & alert | Two load thresholds, each with a colour from the active theme |
@@ -47,13 +47,13 @@ immediately.
 
 | | NVIDIA | AMD | Intel |
 |---|---|---|---|
-| Load | yes | yes | no |
-| VRAM | yes | yes | no |
+| Load | yes | yes | yes, per engine |
+| VRAM | yes | yes | memory held by your processes, no total |
 | Temperature | yes | yes | yes |
 | Power | yes, with limit | yes | no |
 | Clocks | core and memory | core | core |
 | Fan | yes | from PWM | no |
-| Processes | yes | no | no |
+| Processes | yes | no | yes, with load |
 
 Anything a driver does not report is hidden, so the panel only shows real
 readings.
@@ -66,8 +66,18 @@ nothing beyond the kernel. `pciutils` for the card name on AMD and Intel.
 
 ## Notes
 
-I develop and test this against an NVIDIA card. The AMD and Intel paths follow
-the documented sysfs contract but I cannot exercise them.
+I develop and test this against an NVIDIA card. The AMD path follows the
+documented sysfs contract but I cannot exercise it. The Intel path is tested
+on a Panther Lake laptop (xe driver).
+
+Intel load comes from the kernel's per-client DRM accounting in
+`/proc/<pid>/fdinfo`: the engine time every client used since the previous
+poll, over the time elapsed. The headline figure is the busiest engine, as in
+`intel_gpu_top` and `nvtop`. Only your own processes are readable there, so a
+root or container workload does not count towards it; when no client is
+readable at all, the figure falls back to how long the GT spent out of its
+idle state. The first poll after login has nothing to diff against and shows
+a dash.
 
 The process list merges compute clients with the graphics clients from
 `nvidia-smi -q -d PIDS`, so your compositor and browser show up, not just CUDA

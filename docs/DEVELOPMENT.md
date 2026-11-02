@@ -40,8 +40,9 @@ bin/gpuctl doctor
 - Keep in sync on release: `manifest.version`, git tag `vX.Y.Z`,
   `moduleName` in every QML, `PLUGIN_ID`/`REPO_URL` in `bin/gpuctl`,
   README commands.
-- stdlib Python only in `bin/`; no root, no network; locks in
-  `$XDG_RUNTIME_DIR`.
+- stdlib Python only in `bin/`; no root, no network; locks and the
+  between-poll caches (`omarchy-gpu-nvidia.json`, `omarchy-gpu-drm.json`)
+  in `$XDG_RUNTIME_DIR`.
 - Never edit `/usr/share/omarchy/**`.
 - No `git push`, tag push, or marketplace submission unless Daniel says so.
 
@@ -56,6 +57,15 @@ bin/gpuctl doctor
   is nullable and the QML hides the row rather than printing a zero.
 - AMD fan % is derived from `pwm1` (0-255); `fan1_input` is RPM and is not
   a percentage, so it is left null.
+- Intel has no `gpu_busy_percent`. Load is a delta over DRM fdinfo between
+  polls: xe reports `drm-cycles-<engine>` busy ticks against
+  `drm-total-cycles-<engine>` elapsed ticks, i915 reports `drm-engine-<name>`
+  busy nanoseconds against wall time. Only the user's own `/proc/<pid>/fdinfo`
+  is readable; `/proc/*/fd` is walked with readlink first so only DRM fds are
+  opened (~30 ms for 2500 fds). The i915 branch follows the documented
+  format and is untested.
+- xe `act_freq` reads 0 whenever the GT is powered down, so the clock shown
+  is `cur_freq`, the requested one.
 - qmllint reports "unqualified access" for `root.`/`column.` references
   inside inline `component`s and `Component {}` blocks. Those are expected;
   only `Error:` lines matter.

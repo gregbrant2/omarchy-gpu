@@ -219,6 +219,7 @@ Panel {
           root.processes = d.processes
             ? Model.capArray(d.processes, Model.MAX_PROCS).map(function(p) {
                 return { pid: p.pid, memMiB: p.memMiB,
+                         loadPct: (typeof p.loadPct === "number") ? p.loadPct : null,
                          name: Model.capText(p.name, Model.FIELD_MAX) }
               })
             : null
@@ -434,7 +435,9 @@ Panel {
 
                 textFormat: Text.PlainText
                 id: procValue
-                text: Model.mib(procRow.modelData.memMiB)
+                // Intel reports what each client is doing as well as holding.
+                text: (procRow.modelData.loadPct !== null ? Model.pct(procRow.modelData.loadPct) + "   " : "")
+                      + Model.mib(procRow.modelData.memMiB)
                 color: Color.popups.text
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
